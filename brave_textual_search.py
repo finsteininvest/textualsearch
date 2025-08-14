@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Brave Textual Search (no Selenium)
+Brave Textual Search (compact TUI, per-query memory)
 
 Features
-- Textual TUI to enter a query and browse results
-- Press Enter to open the selected result in your default browser
-- Clicked links are remembered (persisted) and hidden in future searches
-- Click events are logged with timestamp, query, title, and URL
+- Textual TUI: Input box + results list
+- Click or press Enter to open a result in your default browser
+- Clicks are remembered PER QUERY and hidden in future searches of that same query
+- Clicks are logged to CSV (timestamp, query, title, url)
+- Pagination with n / p
 
 Setup
   pip install textual requests python-dotenv tenacity
@@ -15,57 +16,64 @@ Setup
 Run
   python brave_textual_search.py
 """
-
 import os
 import json
 import csv
 import sys
 import time
-import webbrowser
-import threading
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 from pathlib import Path
 
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from dotenv import load_dotenv
-from rich.text import Text
+
+version = "1.1"
 
 # ---- Textual Imports ----
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical, Container
-from textual.widgets import Header, Footer, Input, Static, ListView, ListItem, Label, LoadingIndicator
+from textual.containers import Container
+from textual.widgets import Header, Footer, Input, Static, ListView, ListItem, Label
 from textual.reactive import reactive
 from textual.binding import Binding
 from textual.message import Message
 from textual import events
 
-# Load env early (supports .env in working directory)
 load_dotenv()
 
 # ---------- Config & Persistence ----------
 
+# Use current working directory for storage (clicked.json, click_log.csv)
 APP_DIR = Path.cwd()
 CLICKED_PATH = APP_DIR / "clicked.json"
 CLICK_LOG_CSV = APP_DIR / "click_log.csv"
-
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
-def _load_clicked() -> set:
+def _load_clicked() -> dict:
+    """Load clicked URLs mapping: {normalized_query: set(urls)}. Handles legacy list format."""
     if CLICKED_PATH.exists():
         try:
-            return set(json.loads(CLICKED_PATH.read_text("utf-8")))
+            data = json.loads(CLICKED_PATH.read_text("utf-8"))
+            if isinstance(data, list):
+                # Legacy: flat list -> keep as global (ignored for per-query filtering)
+                return {"__global__": set(data)}
+            if isinstance(data, dict):
+                out = {}
+                for k, v in data.items():
+                    if isinstance(v, list):
+                        out[k] = set(v)
+                return out
         except Exception:
-            return set()
-    return set()
+            return {}
+    return {}
 
-def _save_clicked(clicked: set) -> None:
+def _save_clicked(clicked: dict) -> None:
     try:
-        CLICKED_PATH.write_text(json.dumps(sorted(clicked)), encoding="utf-8")
+        serializable = {k: sorted(list(v)) for k, v in clicked.items()}
+        CLICKED_PATH.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
     except Exception as e:
-        # Failing to persist should not crash the app
         print(f"Warning: failed to save clicked.json: {e}", file=sys.stderr)
 
 def _log_click(ts_iso: str, query: str, title: str, url: str) -> None:
@@ -79,6 +87,10 @@ def _log_click(ts_iso: str, query: str, title: str, url: str) -> None:
     except Exception as e:
         print(f"Warning: failed to write click_log.csv: {e}", file=sys.stderr)
 
+def _norm_query(q: str) -> str:
+    """Normalize a query string for use as a key."""
+    return " ".join((q or "").strip().split()).lower()
+
 # ---------- Browser helper ----------
 
 def _open_in_browser(url: str) -> bool:
@@ -90,7 +102,7 @@ def _open_in_browser(url: str) -> bool:
     except Exception:
         pass
     try:
-        import sys, subprocess, os
+        import subprocess
         if sys.platform == "darwin":
             subprocess.Popen(["open", url])
             return True
@@ -150,7 +162,7 @@ def _extract_web_results(payload: Dict[str, Any]) -> List[SearchResult]:
 def brave_search(
     query: str,
     api_key: Optional[str] = None,
-    count: int = 10,
+    count: int = 20,
     page: int = 0,
     country: str = "US",
     search_lang: str = "en",
@@ -192,39 +204,33 @@ def brave_search(
 # ---------- Textual UI ----------
 
 class OpenResult(Message):
-    def __init__(self, result):
+    def __init__(self, result: SearchResult):
         super().__init__()
         self.result = result
 
 class ResultItem(ListItem):
-    """A two-line list item showing a title and URL/snippet, carrying the SearchResult."""
-    def __init__(self, result: 'SearchResult'):
-        super().__init__()
+    """One search hit: title, URL, and a wrapped snippet (compact)."""
+    def __init__(self, result: SearchResult):
         self.result = result
-
-    def compose(self) -> ComposeResult:
-        title = Label(self.result.title or "(untitled)", classes="title")
-        url = Label(self.result.url, classes="url") if self.result.url else Label("")
-        snippet_text = (self.result.snippet or "").strip()
+        title = Label(result.title or "(untitled)", classes="title")
+        url = Label(result.url, classes="url") if result.url else Label("")
+        children = [title, url]
+        snippet_text = (result.snippet or "").strip()
         if snippet_text:
-            snippet = Label(snippet_text, classes="snippet")
-            # Yield labels directly; avoid Vertical which can expand the item
-            yield title
-            yield url
-            yield snippet
-        else:
-            yield title
-            yield url
+            children.append(Label(snippet_text, classes="snippet"))
+        # Mount children via super().__init__ (safe; no manual mount in __init__)
+        super().__init__(*children)
 
     def on_click(self, event: events.Click) -> None:
-        # Single-click to open
         event.stop()
         self.post_message(OpenResult(self.result))
+
 class StatusBar(Static):
     def update_status(self, text: str) -> None:
         self.update(text)
 
 class BraveTextualSearch(App):
+    TITLE = f"Brave Textual Search {version}"
     CSS = """
     Screen {
         layout: vertical;
@@ -249,62 +255,22 @@ class BraveTextualSearch(App):
         color: #b3b3b3;
         text-style: dim;
     }
-
-    #results { padding: 0; }
-    ListItem { padding: 0 1; margin: 0; height: auto; content-align: left top; }
-    .title { text-style: bold; }
-    .snippet { overflow: hidden; max-height: 3; }
-
-
     #results {
         padding: 0;
     }
     ListItem {
         padding: 0 1;
         margin: 0;
-        height: auto;
-        content-align: left top;
     }
     .title { text-style: bold; }
-    .snippet { max-height: 3; overflow: hidden; }
-
-
-    #results {
-        padding: 0;
-
-    }
-    ListItem {
-        padding: 0 1;
-        margin: 0;
-        min-height: 1;
-    }
-    .title {
-        text-style: bold;
-    }
-    .snippet {
-        /* Let Rich handle wrapping; no overflow clipping */
-    }
-
-
-    #results {
-        padding: 0;
-
-    }
-    ListItem {
-        padding: 0 1;
-        margin: 0;
-        min-height: 1;
-    }
-    .title {
-        text-style: bold;
-    }
-
     """
 
     BINDINGS = [
         Binding("enter", "open_selected", "Open"),
         Binding("n", "next_page", "Next page"),
         Binding("p", "prev_page", "Prev page"),
+        Binding("q", "quit", "Quit"),
+        Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+c", "quit", "Quit"),
         Binding("escape", "clear_query", "Clear query"),
     ]
@@ -316,8 +282,7 @@ class BraveTextualSearch(App):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.clicked = _load_clicked()
-        self.current_results: List[SearchResult] = []
+        self.clicked: Dict[str, set] = _load_clicked()
         self.current_query: str = ""
         self.count_per_page = 20
 
@@ -344,13 +309,12 @@ class BraveTextualSearch(App):
         # Focus results and select first item so Enter works immediately
         try:
             if lv.children:
-                # Prefer built-in actions if available
-                if hasattr(lv, 'action_cursor_home'):
+                if hasattr(lv, "action_cursor_home"):
                     lv.action_cursor_home()
-                elif hasattr(lv, 'index'):
+                elif hasattr(lv, "index"):
                     lv.index = 0
                 # Focus the list view
-                if hasattr(self, 'set_focus'):
+                if hasattr(self, "set_focus"):
                     self.set_focus(lv)
                 else:
                     lv.focus()
@@ -369,8 +333,10 @@ class BraveTextualSearch(App):
         try:
             payload = brave_search(query=query, count=self.count_per_page, page=page)
             all_results = _extract_web_results(payload)
-            # Filter out clicked URLs
-            filtered = [r for r in all_results if r.url and r.url not in self.clicked]
+            # Filter out URLs clicked for THIS query only
+            key = _norm_query(query)
+            clicked_for_q = self.clicked.get(key, set())
+            filtered = [r for r in all_results if r.url and r.url not in clicked_for_q]
             hidden = len(all_results) - len(filtered)
             altered = (payload.get("query") or {}).get("altered")
             self.call_from_thread(self._populate_results, filtered, hidden, altered)
@@ -378,35 +344,18 @@ class BraveTextualSearch(App):
             self.call_from_thread(self._set_status, f"[error] {e}")
 
     def do_search(self, query: str, page: int = 0):
+        import threading
         self.current_query = query
         self.page = page
         self._set_status("Searching…")
-        # Run network in background thread to keep UI responsive
         threading.Thread(target=self._search_thread, args=(query, page), daemon=True).start()
-
-    # ----- Open helper -----
-    def open_result(self, result: 'SearchResult', source_item: 'ResultItem|None' = None) -> None:
-        if result and result.url:
-            ok = _open_in_browser(result.url)
-            ts_iso = datetime.now().astimezone().isoformat(timespec="seconds")
-            _log_click(ts_iso, self.current_query or self.query or "", result.title, result.url)
-            self.clicked.add(result.url)
-            _save_clicked(self.clicked)
-            try:
-                if source_item is not None:
-                    lv = self.query_one("#results", ListView)
-                    lv.remove(source_item)
-            except Exception:
-                pass
-            self._set_status(f"{'Opened' if ok else 'Tried to open'}: {result.title or result.url}")
 
     # ----- Actions -----
     def action_quit(self) -> None:
-        # Force exit regardless of which widget has focus
         self.exit()
 
     def on_key(self, event) -> None:
-        # Ensure Ctrl+C always quits
+        # Ctrl+C quits regardless of focus
         try:
             if getattr(event, "key", None) == "c" and getattr(event, "ctrl", False):
                 event.stop()
@@ -414,12 +363,10 @@ class BraveTextualSearch(App):
                 return
         except Exception:
             pass
-
-        # Pressing Enter should open the selected result when focus is not in the query Input
+        # Enter opens the selected item when focus is not on the query input
         try:
             if getattr(event, "key", None) in ("enter", "return"):
                 focused = getattr(self.screen, "focused", None)
-                # If focus is NOT the query input, interpret Enter as 'open selected'
                 if not getattr(focused, "id", "") == "query_input":
                     event.stop()
                     self.action_open_selected()
@@ -451,7 +398,7 @@ class BraveTextualSearch(App):
             except Exception:
                 pass
 
-    # ----- Actions -----
+    # ----- Navigation & Open -----
     def action_next_page(self) -> None:
         if not self.current_query:
             return
@@ -469,11 +416,30 @@ class BraveTextualSearch(App):
         input_box.value = ""
         input_box.focus()
 
+    def open_result(self, result: SearchResult, source_item: "ResultItem|None" = None) -> None:
+        if result and result.url:
+            ok = _open_in_browser(result.url)
+            ts_iso = datetime.now().astimezone().isoformat(timespec="seconds")
+            q = self.current_query or self.query or ""
+            _log_click(ts_iso, q, result.title, result.url)
+            # Remember under THIS query
+            key = _norm_query(q)
+            if key:
+                self.clicked.setdefault(key, set()).add(result.url)
+            _save_clicked(self.clicked)
+            # Remove from current view
+            try:
+                if source_item is not None:
+                    lv = self.query_one("#results", ListView)
+                    lv.remove(source_item)
+            except Exception:
+                pass
+            self._set_status(f"{'Opened' if ok else 'Tried to open'}: {result.title or result.url}")
+
     def action_open_selected(self) -> None:
         lv = self.query_one("#results", ListView)
         if not lv.children:
             return
-
         item = None
         # 1) highlighted_child if available
         try:
@@ -482,7 +448,6 @@ class BraveTextualSearch(App):
                 item = hc
         except Exception:
             pass
-
         # 2) index-based selection
         if item is None:
             try:
@@ -497,14 +462,12 @@ class BraveTextualSearch(App):
                             item = None
             except Exception:
                 pass
-
         # 3) Fallback to first child
         if item is None and lv.children:
             try:
                 item = list(lv.children)[0]
             except Exception:
                 item = None
-
         if isinstance(item, ResultItem):
             self.open_result(item.result, item)
 
